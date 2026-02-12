@@ -11,6 +11,8 @@ import {
   LucideBrain,
   MessageSquare,
   RefreshCw,
+  Mic,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -47,11 +49,36 @@ import {
 } from "ai";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
+import { Orb, type AgentState } from "@/components/ui/orb";
+import { useSpeechRecognition } from "@/hooks/use-speech-recognition"
+import { useAudioPlayer } from "@/hooks/use-audio-player"
+
 
 const PmPage = () => {
   const params = useParams();
   const [input, setInput] = React.useState("");
+  const [isOrbVisible, setIsOrbVisible] = React.useState(false);
   const repoId = params.repoId as Id<"repositories">;
+  
+  // Voice Hooks
+  const { 
+    isListening, 
+    transcript, 
+    startListening, 
+    stopListening, 
+    resetTranscript 
+  } = useSpeechRecognition()
+  
+  const { 
+    playAudio, 
+    stopAudio, 
+    isPlaying: isAgentSpeaking, 
+    volume: outputVolume 
+  } = useAudioPlayer()
+
+  // Track if we are waiting for a response to speak
+  const [isWaitingForTTS, setIsWaitingForTTS] = React.useState(false)
+  const processedMessageIds = React.useRef<Set<string>>(new Set())
 
   const {
     messages,
@@ -62,12 +89,68 @@ const PmPage = () => {
   } = useChat({
     transport: new DefaultChatTransport({
       api: "/api/agent/chat",
+      body: {
+        repoId: repoId || params.repoId,
+      },
     }),
-    // body: {
-    //   repoId,
-    // },
     sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithApprovalResponses,
+    onFinish: async (result: any) => {
+      // Handle both potential signatures (message directly or { message })
+      const message = result.message || result;
+      
+      // Only speak if we are in "voice mode" (orb visible) and message is from assistant
+      if (isOrbVisible && message.role === "assistant" && !processedMessageIds.current.has(message.id)) {
+        processedMessageIds.current.add(message.id)
+        
+        // Extract text from parts if available (v4 SDK style), otherwise use content
+        const textToSpeak = message.parts 
+          ? message.parts
+              .filter((p: any) => p.type === 'text')
+              .map((p: any) => p.text || (p as any).content)
+              .join(' ')
+          : message.content;
+
+        if (!textToSpeak || !textToSpeak.trim()) return;
+
+        setIsWaitingForTTS(true)
+        try {
+            const response = await fetch('/api/voice', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: textToSpeak }),
+            });
+            
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.error || 'Failed to generate audio');
+            }
+
+            const { audio } = await response.json();
+            await playAudio(audio)
+        } catch (e) {
+            console.error("TTS Error", e)
+        } finally {
+            setIsWaitingForTTS(false)
+        }
+      }
+    }
   });
+
+  // Auto-submit logic for voice
+  React.useEffect(() => {
+    if (isListening && transcript) {
+        // Debounce silence to detect end of speech
+        const timer = setTimeout(() => {
+            stopListening()
+            sendMessage({
+                parts: [{ type: "text", text: transcript }]
+            })
+            resetTranscript()
+        }, 1500) // 1.5s silence
+
+        return () => clearTimeout(timer)
+    }
+  }, [transcript, isListening, stopListening, sendMessage, resetTranscript])
 
   const isLastMessageFromAssistant =
     messages.length > 0 && messages[messages.length - 1].role === "assistant";
@@ -81,8 +164,63 @@ const PmPage = () => {
     setInput("");
   };
 
+  // Determine agent state based on chat status and voice state
+  const getAgentState = (): AgentState => {
+    if (isAgentSpeaking) return "talking"
+    if (isListening) return "listening"
+    if (status === "submitted" || isWaitingForTTS) return "thinking"
+    if (status === "streaming") return "thinking" // While streaming text, we are technically "thinking" about the audio? Or should we show "talking" if text is appearing? Let's say thinking until audio plays.
+    return null; // Default to idle
+  };
+  
+  const handleMicClick = () => {
+    setIsOrbVisible(true)
+    startListening()
+  }
+  
+  const handleCloseOrb = () => {
+      setIsOrbVisible(false)
+      stopListening()
+      stopAudio()
+  }
+
   return (
     <div className="h-[calc(100vh-60px)] w-full flex flex-col relative px-12">
+      {/* Voice Interaction Button */}
+      <div className="absolute top-4 right-4 z-40">
+        <Button
+          variant="outline"
+          size="icon"
+          className={`rounded-full h-10 w-10 border-violet-500/50 hover:bg-violet-500/10 hover:border-violet-500 text-violet-500 ${isListening ? "animate-pulse bg-violet-500/20" : ""}`}
+          onClick={handleMicClick}
+        >
+          <Mic className="h-5 w-5" />
+        </Button>
+      </div>
+
+      {/* Orb Overlay */}
+      {isOrbVisible && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md animate-in fade-in duration-500">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="absolute top-8 right-8 text-white/50 hover:text-white hover:bg-white/10 rounded-full h-12 w-12 transition-all duration-300"
+            onClick={handleCloseOrb}
+          >
+            <X className="h-6 w-6" />
+          </Button>
+          
+          <div className="relative h-[200px] w-[200px] animate-in zoom-in-95 duration-500 spring-3">
+            <Orb
+              // Colors are now handled internally based on agentState
+              agentState={getAgentState()}
+              className="h-full w-full"
+              inputVolumeRef={{ current: 0 }} 
+              outputVolumeRef={{ current: outputVolume }}
+            />
+          </div>
+        </div>
+      )}
       <Conversation>
         <ConversationContent>
           {messages.length === 0 ? (
@@ -116,6 +254,12 @@ const PmPage = () => {
                       }
 
                       if (part.type === "text") {
+                        // Skip rendering assistant text while the Orb is visible
+                     
+                        if (isOrbVisible && message.role === "assistant") {
+                          return null;
+                        }
+
                         return (
                           <Message
                             key={`${message.id}-${partIndex}`}

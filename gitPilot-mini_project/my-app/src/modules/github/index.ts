@@ -8,18 +8,24 @@ import { Octokit } from "octokit";
 // GETTING GITHUB ACCESS TOKEN FROM CLERK
 // ========================================
 export async function getGithubAccessToken() {
-  const { userId } = await auth();
-  if (!userId) {
-    throw new Error("Not authenticated");
+  try {
+    const { userId } = await auth();
+    if (!userId) {
+      console.warn("getGithubAccessToken: No userId found");
+      return null;
+    }
+
+    const client = await clerkClient();
+
+    const tokens = await client.users.getUserOauthAccessToken(userId, "github");
+
+    const accessToken = tokens.data[0]?.token;
+    // console.log("accessToken", accessToken);
+    return accessToken;
+  } catch (error) {
+    console.error("Error in getGithubAccessToken:", error);
+    return null;
   }
-
-  const client = await clerkClient();
-
-  const tokens = await client.users.getUserOauthAccessToken(userId, "github");
-
-  const accessToken = tokens.data[0]?.token;
-  console.log("accessToken", accessToken);
-  return accessToken;
 }
 // ---------------------------------------
 // GITHUB TOKEN JUST FOR INNGEST
@@ -207,35 +213,53 @@ export const getReadme = async (owner: string, repo: string) => {
 // CREATING WEBHOOK
 // ============================
 export const createWebhook = async (owner: string, repo: string) => {
-  const token = await getGithubAccessToken();
+  try {
+    const token = await getGithubAccessToken();
+    if (!token) {
+      console.warn("createWebhook: No GitHub token found");
+      return null;
+    }
 
-  const octokit = new Octokit({ auth: token });
+    const octokit = new Octokit({ auth: token });
 
-  const webhookUrl = `${process.env.NGROK_URL}/api/webhooks/github`;
+    const webhookUrl = `${process.env.NGROK_URL}/api/webhooks/github`;
 
-  const { data: hooks } = await octokit.rest.repos.listWebhooks({
-    owner,
-    repo,
-  });
+    let hooks: any[] = [];
+    try {
+      const { data } = await octokit.rest.repos.listWebhooks({
+        owner,
+        repo,
+      });
+      hooks = data;
+    } catch (error: any) {
+      console.warn(
+        `Could not list webhooks for ${owner}/${repo}. Status: ${error.status}`,
+      );
+      // If we can't list webhooks, we'll try to create it anyway (it might fail too, but we handle that below)
+    }
 
-  const exisitingHook = hooks.find((hook) => hook.config.url === webhookUrl);
-  if (exisitingHook) {
-    return exisitingHook;
+    const exisitingHook = hooks.find((hook) => hook.config.url === webhookUrl);
+    if (exisitingHook) {
+      return exisitingHook;
+    }
+
+    const { data } = await octokit.rest.repos.createWebhook({
+      owner,
+      repo,
+      config: {
+        url: webhookUrl,
+        content_type: "json",
+      },
+      events: ["pull_request", "push", "issues"],
+    });
+
+    console.log("Webhook created successfully");
+
+    return data;
+  } catch (error) {
+    console.error("❌ Error in createWebhook:", error);
+    return null;
   }
-
-  const { data } = await octokit.rest.repos.createWebhook({
-    owner,
-    repo,
-    config: {
-      url: webhookUrl,
-      content_type: "json",
-    },
-    events: ["pull_request", "push", "issues"],
-  });
-
-  console.log("Webhook created successfully");
-
-  return data;
 };
 
 // ===============================
