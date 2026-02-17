@@ -79,6 +79,7 @@ const PmPage = () => {
   // Track if we are waiting for a response to speak
   const [isWaitingForTTS, setIsWaitingForTTS] = React.useState(false)
   const processedMessageIds = React.useRef<Set<string>>(new Set())
+  const voiceMessageIds = React.useRef<Set<string>>(new Set())
 
   const {
     messages,
@@ -151,6 +152,29 @@ const PmPage = () => {
         return () => clearTimeout(timer)
     }
   }, [transcript, isListening, stopListening, sendMessage, resetTranscript])
+
+  // Continuous voice mode: restart listening after agent finishes speaking
+  React.useEffect(() => {
+      if (isOrbVisible && !isAgentSpeaking && !isListening && !isWaitingForTTS && status !== 'submitted' && status !== 'streaming') {
+          const timeout = setTimeout(() => {
+              startListening()
+          }, 100)
+          return () => clearTimeout(timeout)
+      }
+  }, [isOrbVisible, isAgentSpeaking, isListening, isWaitingForTTS, status, startListening])
+
+  // Track messages created during voice mode
+  const previousMessageCountRef = React.useRef(0)
+  React.useEffect(() => {
+      if (isOrbVisible) {
+          // Only tag messages that are NEW (added after Orb opened)
+          const newMessages = messages.slice(previousMessageCountRef.current)
+          newMessages.forEach(message => {
+              voiceMessageIds.current.add(message.id)
+          })
+      }
+      previousMessageCountRef.current = messages.length
+  }, [messages, isOrbVisible])
 
   const isLastMessageFromAssistant =
     messages.length > 0 && messages[messages.length - 1].role === "assistant";
@@ -239,6 +263,7 @@ const PmPage = () => {
                   <div key={message.id}>
                     {message.parts.map((part, partIndex) => {
                       if (part.type === "reasoning") {
+                        if (isOrbVisible || voiceMessageIds.current.has(message.id)) return null;
                         return (
                           <Reasoning
                             key={`${message.id}-${partIndex}`}
@@ -254,10 +279,9 @@ const PmPage = () => {
                       }
 
                       if (part.type === "text") {
-                        // Skip rendering assistant text while the Orb is visible
-                     
-                        if (isOrbVisible && message.role === "assistant") {
-                          return null;
+                        // Skip rendering text while the Orb is visible or if created during voice mode
+                        if (isOrbVisible || voiceMessageIds.current.has(message.id)) {
+                            return null;
                         }
 
                         return (
