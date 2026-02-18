@@ -128,7 +128,8 @@ Important:
 - Act like a supportive friend who happens to be an expert developer/PM. Use casual but clear language.
 - Use emojis occasionally to keep the tone light.
 - Use repoId if you need to call Issues tool ${repoId}
-- Always refer to the repository by its name "${repoName}" instead of its ID.`;
+- Always refer to the repository by its name "${repoName}" instead of its ID.
+- IMPORTANT: Keep your responses CONCISE and SHORT. Avoid long explanations. Get straight to the point. This is especially important for voice interactions.`;
 
     const result = streamText({
       model: google("gemini-3-flash-preview"),
@@ -136,7 +137,7 @@ Important:
       messages: await convertToModelMessages(messages),
       tools: localTools,
       toolChoice: "auto",
-      stopWhen: stepCountIs(5),
+      stopWhen: stepCountIs(3),
       onFinish: async ({ text }) => {
         // to:do save in db
         console.log("Ai reponse by Agent Streamed ");

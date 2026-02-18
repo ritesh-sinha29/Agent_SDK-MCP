@@ -58,6 +58,7 @@ const PmPage = () => {
   const params = useParams();
   const [input, setInput] = React.useState("");
   const [isOrbVisible, setIsOrbVisible] = React.useState(false);
+  const [activeStatus, setActiveStatus] = React.useState<string | null>(null);
   const repoId = params.repoId as Id<"repositories">;
   
   // Voice Hooks
@@ -73,13 +74,19 @@ const PmPage = () => {
     playAudio, 
     stopAudio, 
     isPlaying: isAgentSpeaking, 
-    volume: outputVolume 
+    volume: outputVolume,
+    currentSubtitle 
   } = useAudioPlayer()
 
   // Track if we are waiting for a response to speak
   const [isWaitingForTTS, setIsWaitingForTTS] = React.useState(false)
   const processedMessageIds = React.useRef<Set<string>>(new Set())
   const voiceMessageIds = React.useRef<Set<string>>(new Set())
+  
+  // Streaming TTS refs
+  const sentenceBufferRef = React.useRef("");
+  const lastProcessedIndexRef = React.useRef(0);
+  const hasSpokenFillerRef = React.useRef(false);
 
   const {
     messages,
@@ -95,47 +102,123 @@ const PmPage = () => {
       },
     }),
     sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithApprovalResponses,
-    onFinish: async (result: any) => {
-      // Handle both potential signatures (message directly or { message })
-      const message = result.message || result;
-      
-      // Only speak if we are in "voice mode" (orb visible) and message is from assistant
-      if (isOrbVisible && message.role === "assistant" && !processedMessageIds.current.has(message.id)) {
-        processedMessageIds.current.add(message.id)
-        
-        // Extract text from parts if available (v4 SDK style), otherwise use content
-        const textToSpeak = message.parts 
-          ? message.parts
-              .filter((p: any) => p.type === 'text')
-              .map((p: any) => p.text || (p as any).content)
-              .join(' ')
-          : message.content;
-
-        if (!textToSpeak || !textToSpeak.trim()) return;
-
-        setIsWaitingForTTS(true)
-        try {
-            const response = await fetch('/api/voice', {
+    onFinish: () => {
+        // Final flush of any remaining text in buffer
+        if (isOrbVisible && sentenceBufferRef.current.trim()) {
+            const finalSentence = sentenceBufferRef.current.trim();
+            fetch('/api/voice', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text: textToSpeak }),
+                body: JSON.stringify({ text: finalSentence }),
+            }).then(res => res.json()).then(data => {
+                if (data.audio) playAudio(data.audio, finalSentence);
             });
-            
-            if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.error || 'Failed to generate audio');
-            }
-
-            const { audio } = await response.json();
-            await playAudio(audio)
-        } catch (e) {
-            console.error("TTS Error", e)
-        } finally {
-            setIsWaitingForTTS(false)
+            sentenceBufferRef.current = "";
         }
-      }
+        setActiveStatus(null);
+        hasSpokenFillerRef.current = false;
     }
   });
+
+  // Streaming Sentence Detection & TTS
+  React.useEffect(() => {
+    if (!isOrbVisible || status !== 'streaming') return;
+
+    const lastMessage = messages[messages.length - 1];
+    if (!lastMessage || lastMessage.role !== 'assistant') return;
+
+    // Correctly extract text from parts (v4 SDK style)
+    const currentContent = lastMessage.parts
+        .filter((p: any) => p.type === 'text')
+        .map((p: any) => p.text || (p as any).content)
+        .join('');
+    
+    const newText = currentContent.slice(lastProcessedIndexRef.current);
+    
+    if (newText) {
+        sentenceBufferRef.current += newText;
+        lastProcessedIndexRef.current = currentContent.length;
+
+        // Detect sentence boundaries
+        const sentences = sentenceBufferRef.current.match(/[^.!?]+[.!?](\s|$)/g);
+        if (sentences) {
+            sentences.forEach(async (sentence) => {
+                const trimmed = sentence.trim();
+                if (!trimmed) return;
+
+                // Remove from buffer
+                sentenceBufferRef.current = sentenceBufferRef.current.replace(sentence, "");
+
+                try {
+                    const response = await fetch('/api/voice', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text: trimmed }),
+                    });
+                    const { audio } = await response.json();
+                    if (audio) playAudio(audio, trimmed);
+                } catch (e) {
+                    console.error("Streaming TTS error", e);
+                }
+            });
+        }
+    }
+  }, [messages, status, isOrbVisible, playAudio]);
+
+  // Handle Visual Status & Audio Fillers
+  React.useEffect(() => {
+    if (!isOrbVisible) {
+        setActiveStatus(null);
+        return;
+    }
+
+    if (status === 'submitted') {
+        setActiveStatus("Thinking...");
+    } else if (status === 'streaming') {
+        const lastMessage = messages[messages.length - 1];
+        const lastPart = lastMessage?.parts[lastMessage.parts.length - 1];
+        
+        if (lastPart?.type.startsWith('tool-')) {
+            const toolName = lastPart.type.replace('tool-', '');
+            const statusMap: Record<string, string> = {
+                'searchWeb': 'Searching the web...',
+                'getIssues': 'Checking issues...',
+                'sendEmail': 'Sending email...',
+            };
+            const currentStatus = statusMap[toolName] || `Using ${toolName}...`;
+            setActiveStatus(currentStatus);
+
+            // Play audio filler if tool call takes too long
+            if (!hasSpokenFillerRef.current && !isAgentSpeaking) {
+                const timer = setTimeout(async () => {
+                    if (status === 'streaming' && !isAgentSpeaking) {
+                        hasSpokenFillerRef.current = true;
+                        const fillerText = "One moment while I look that up...";
+                        const response = await fetch('/api/voice', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ text: fillerText }),
+                        });
+                        const { audio } = await response.json();
+                        if (audio) playAudio(audio, fillerText);
+                    }
+                }, 2500); // 2.5s delay for filler
+                return () => clearTimeout(timer);
+            }
+        } else {
+            setActiveStatus("Generating response...");
+        }
+    }
+  }, [status, messages, isOrbVisible, isAgentSpeaking, playAudio]);
+
+  // Reset indices when a new interaction begins
+  React.useEffect(() => {
+      if (status === 'submitted') {
+          sentenceBufferRef.current = "";
+          lastProcessedIndexRef.current = 0;
+          hasSpokenFillerRef.current = false;
+      }
+  }, [status]);
 
   // Auto-submit logic for voice
   React.useEffect(() => {
@@ -147,7 +230,7 @@ const PmPage = () => {
                 parts: [{ type: "text", text: transcript }]
             })
             resetTranscript()
-        }, 1500) // 1.5s silence
+        }, 800) // 800ms silence
 
         return () => clearTimeout(timer)
     }
@@ -243,6 +326,23 @@ const PmPage = () => {
               outputVolumeRef={{ current: outputVolume }}
             />
           </div>
+          {activeStatus && !currentSubtitle && (
+            <div className="absolute bottom-20 left-1/2 -translate-x-1/2 text-white/80 text-lg font-medium animate-pulse tracking-wide">
+              {activeStatus}
+            </div>
+          )}
+          {currentSubtitle && (
+            <div className="absolute bottom-24 left-1/2 -translate-x-1/2 w-full max-w-4xl px-4 flex justify-center pointer-events-none">
+              <div className="bg-black/40 backdrop-blur-sm px-6 py-2 rounded-2xl border border-white/10 shadow-xl transition-all duration-500 animate-in fade-in slide-in-from-bottom-2">
+                <p 
+                  className="text-white text-lg font-medium tracking-wide leading-relaxed text-center"
+                  style={{ fontFamily: '"Times New Roman", Times, serif' }}
+                >
+                  {currentSubtitle}
+                </p>
+              </div>
+            </div>
+          )}
         </div>
       )}
       <Conversation>
